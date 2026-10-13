@@ -1,6 +1,6 @@
 Script to delete all X / Twitter tweets. (Credits go to https://github.com/techleadhd, who let ChatGPT create the first version.). 
 
-Updated to add a MAX_AGE_DAYS to keep some recents posts
+Updated by Claude to add a MAX_AGE_DAYS to keep some recents posts
 
 ### How to run:
 - Open Chrome and go to your X profile (https://x.com/USERNAME/with_replies)
