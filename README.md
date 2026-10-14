@@ -27,6 +27,7 @@ const deleteAllTweets = async () => {
     caret: '[data-testid="caret"]',
     userName: '[data-testid="User-Name"] a[href^="/"]',
     profileLink: '[data-testid="AppTabBar_Profile_Link"]',
+    accountSwitcher: '[data-testid="SideNav_AccountSwitcher_Button"]',
     menuItem: '[role="menuitem"]',
     deleteConfirm: '[data-testid="confirmationSheetConfirm"]',
     unretweet: '[data-testid="unretweet"]',
@@ -44,13 +45,42 @@ const deleteAllTweets = async () => {
     return new Promise(r => setTimeout(r, ms + (Math.random() * jitter * 2 - jitter)));
   };
 
+  // Wait with a countdown in the console, once per minute (stoppable)
+  const countdown = async (ms, label) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (window.stopDelete) return;
+      const left = Math.ceil((end - Date.now()) / 60000);
+      console.log(`${label}: ${left} minute${left === 1 ? '' : 's'} left...`);
+      await new Promise(r => setTimeout(r, Math.min(60000, end - Date.now())));
+    }
+    console.log(`${label} over, continuing.`);
+  };
+
   // ----- Pre-checks -----
-  const profileLink = document.querySelector(selectors.profileLink);
-  if (!profileLink) {
-    console.error('Profile link not found. Is the console context set to "top" and are you logged in?');
+  // Find your handle: 1) profile link, 2) account switcher, 3) the page URL
+  const getMyHandle = () => {
+    const link = document.querySelector(selectors.profileLink)?.getAttribute('href');
+    if (link) return link;
+
+    const switcher = document.querySelector(selectors.accountSwitcher);
+    const m = switcher?.textContent.match(/@(\w+)/);
+    if (m) return '/' + m[1];
+
+    const fromUrl = location.pathname.split('/')[1];
+    if (fromUrl && !['home', 'explore', 'notifications', 'messages', 'i', 'settings', 'search'].includes(fromUrl)) {
+      return '/' + fromUrl;
+    }
+    return null;
+  };
+
+  const handle = getMyHandle();
+  if (!handle) {
+    console.error('Could not determine your username. Open your own profile (x.com/yourname/with_replies) and try again.');
     return;
   }
-  const myHandle = profileLink.getAttribute('href').toLowerCase(); // e.g. "/username"
+  const myHandle = handle.toLowerCase();
+  console.log(`Detected account: ${myHandle}`);
 
   // Wait up to 30 seconds for tweets to appear
   for (let i = 0; i < 15 && !document.querySelector(selectors.tweet); i++) {
@@ -82,10 +112,9 @@ const deleteAllTweets = async () => {
   const waitIfRateLimited = async () => {
     if (!rateLimited) return;
     console.warn(`429 on delete. Pausing ${Math.round(backoff / 60000)} min (from ${new Date().toLocaleTimeString()})...`);
-    await delay(backoff);
+    await countdown(backoff, 'Rate limit pause');
     backoff = Math.min(backoff * 2, 2 * 3600000);
     rateLimited = false;
-    console.log('Resuming...');
   };
 
   // ----- Helpers -----
@@ -203,7 +232,7 @@ const deleteAllTweets = async () => {
           await delay(DELETE_DELAY);
           if (deleted % BATCH_SIZE === 0) {
             console.log(`Batch of ${BATCH_SIZE} done, pausing ${BATCH_PAUSE / 60000} min...`);
-            await delay(BATCH_PAUSE);
+            await countdown(BATCH_PAUSE, 'Batch pause');
           }
         }
       }
