@@ -16,7 +16,7 @@ const deleteAllTweets = async () => {
   const BATCH_SIZE = 50;               // after this many deletions...
   const BATCH_PAUSE = 5 * 60000;       // ...take a 5-minute break
   const RATE_LIMIT_PAUSE = 15 * 60000; // first pause after a 429 (doubles each time, max 2h)
-  const EMPTY_RETRIES = 3;             // scroll attempts with no new tweets before stopping
+  const END_RETRIES = 6;               // attempts at the bottom of the page before stopping
   const DEBUG = true;                  // false = less console output
   // ====================
 
@@ -35,8 +35,9 @@ const deleteAllTweets = async () => {
   };
 
   const cutoff = Date.now() - MAX_AGE_DAYS * 86400000;
-  const processed = new Set();
-  let deleted = 0, skipped = 0, rateLimited = false, backoff = RATE_LIMIT_PAUSE;
+  const processed = new Set();     // tweet IDs already handled
+  const seenNoId = new WeakSet();  // elements without an ID (ads etc.)
+  let deleted = 0, skipped = 0, rateLimited = null, backoff = RATE_LIMIT_PAUSE;
 
   const log = (...a) => DEBUG && console.log(...a);
 
@@ -58,15 +59,16 @@ const deleteAllTweets = async () => {
   };
 
   // ----- Pre-checks -----
-  // Find your handle: 1) profile link, 2) account switcher, 3) the page URL
+  if (!/(^|\.)x\.com$|(^|\.)twitter\.com$/.test(location.hostname)) {
+    console.error(`Wrong console context (${location.href}). Select "top" in the Console dropdown.`);
+    return;
+  }
+
   const getMyHandle = () => {
     const link = document.querySelector(selectors.profileLink)?.getAttribute('href');
     if (link) return link;
-
-    const switcher = document.querySelector(selectors.accountSwitcher);
-    const m = switcher?.textContent.match(/@(\w+)/);
+    const m = document.querySelector(selectors.accountSwitcher)?.textContent.match(/@(\w+)/);
     if (m) return '/' + m[1];
-
     const fromUrl = location.pathname.split('/')[1];
     if (fromUrl && !['home', 'explore', 'notifications', 'messages', 'i', 'settings', 'search'].includes(fromUrl)) {
       return '/' + fromUrl;
@@ -82,7 +84,6 @@ const deleteAllTweets = async () => {
   const myHandle = handle.toLowerCase();
   console.log(`Detected account: ${myHandle}`);
 
-  // Wait up to 30 seconds for tweets to appear
   for (let i = 0; i < 15 && !document.querySelector(selectors.tweet); i++) {
     if (i === 0) console.log('Waiting for tweets to load...');
     await delay(2000);
@@ -92,49 +93,66 @@ const deleteAllTweets = async () => {
     return;
   }
 
-  // ----- 429 detection (only on delete/unretweet requests) -----
-  const isDeleteCall = url => /DeleteTweet|DeleteRetweet|unretweet/i.test(url || '');
+  // ----- 429 detection: deletions AND timeline loading -----
+  const watched = url => {
+    if (/DeleteTweet|DeleteRetweet|unretweet/i.test(url || '')) return 'delete';
+    if (/UserTweets|UserTweetsAndReplies|UserMedia/i.test(url || '')) return 'timeline';
+    return null;
+  };
   const origFetch = window.fetch;
   window.fetch = async (...args) => {
     const res = await origFetch(...args);
     const url = typeof args[0] === 'string' ? args[0] : args[0]?.url;
-    if (res.status === 429 && isDeleteCall(url)) rateLimited = true;
+    if (res.status === 429 && watched(url)) rateLimited = watched(url);
     return res;
   };
   const origOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
     this.addEventListener('load', () => {
-      if (this.status === 429 && isDeleteCall(url)) rateLimited = true;
+      if (this.status === 429 && watched(url)) rateLimited = watched(url);
     });
     return origOpen.call(this, method, url, ...rest);
   };
 
   const waitIfRateLimited = async () => {
-    if (!rateLimited) return;
-    console.warn(`429 on delete. Pausing ${Math.round(backoff / 60000)} min (from ${new Date().toLocaleTimeString()})...`);
+    if (!rateLimited) return false;
+    console.warn(`429 on ${rateLimited}. Pausing ${Math.round(backoff / 60000)} min (from ${new Date().toLocaleTimeString()})...`);
     await countdown(backoff, 'Rate limit pause');
     backoff = Math.min(backoff * 2, 2 * 3600000);
-    rateLimited = false;
+    rateLimited = null;
+    return true;
   };
 
   // ----- Helpers -----
+  const getTweetId = tweet =>
+    tweet.querySelector('time')?.closest('a')?.getAttribute('href') || null;
+
   const getTweetDate = tweet => {
-    const time = tweet?.querySelector('time[datetime]'); // first = outer tweet, not a quoted one
+    const time = tweet.querySelector('time[datetime]'); // first = outer tweet, not a quoted one
     return time ? new Date(time.getAttribute('datetime')) : null;
   };
 
   const isOwnTweet = tweet =>
-    tweet?.querySelector(selectors.userName)?.getAttribute('href').toLowerCase() === myHandle;
+    tweet.querySelector(selectors.userName)?.getAttribute('href').toLowerCase() === myHandle;
 
   const closeMenu = () =>
     document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
 
-  const getButtons = () =>
-    Array.from(document.querySelectorAll(`${selectors.tweet} ${selectors.caret}`))
-      .filter(b => !processed.has(b));
+  const getNewTweets = () =>
+    Array.from(document.querySelectorAll(selectors.tweet)).filter(t => {
+      const id = getTweetId(t);
+      return id ? !processed.has(id) : !seenNoId.has(t);
+    });
 
-  const scrollToEnd = () =>
-    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+  const atBottom = () =>
+    window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 100;
+
+  const clickRetryIfShown = () => {
+    const retry = Array.from(document.querySelectorAll('[role="button"], button'))
+      .find(b => /^(Retry|Opnieuw proberen)$/i.test(b.textContent.trim()));
+    if (retry) { log('Clicking "Retry" on timeline...'); retry.click(); return true; }
+    return false;
+  };
 
   // ----- Actions -----
   const doUnretweet = async (tweet, date) => {
@@ -146,14 +164,16 @@ const deleteAllTweets = async () => {
     if (!confirm) { log('Unretweet clicked, but no confirm button found'); closeMenu(); return false; }
     confirm.click();
     await delay(1500);
-    if (rateLimited) return null; // retry later
+    if (rateLimited === 'delete') return null;
     deleted++;
     console.log(`#${deleted} Unretweeted post from ${date.toLocaleDateString()}`);
     return true;
   };
 
-  const doDelete = async (button, date) => {
-    button.click();
+  const doDelete = async (tweet, date) => {
+    const caret = tweet.querySelector(selectors.caret);
+    if (!caret) { log('No menu button on tweet'); return false; }
+    caret.click();
     await delay(500);
     const menuItems = Array.from(document.querySelectorAll(selectors.menuItem));
     const deleteOption = menuItems.find(item =>
@@ -171,18 +191,19 @@ const deleteAllTweets = async () => {
     if (!confirm) { log('Delete clicked, but no confirm button found'); closeMenu(); return false; }
     confirm.click();
     await delay(1500);
-    if (rateLimited) return null; // retry later
+    if (rateLimited === 'delete') return null;
     deleted++;
     console.log(`#${deleted} Deleted tweet from ${date.toLocaleDateString()}`);
     return true;
   };
 
-  const processTweet = async button => {
-    processed.add(button);
-    const tweet = button.closest(selectors.tweet);
-    const date = getTweetDate(tweet);
+  const processTweet = async tweet => {
+    const id = getTweetId(tweet);
+    if (!id) { seenNoId.add(tweet); skipped++; log('Skipped: no ID/date (ad/promoted?)'); return false; }
+    processed.add(id);
 
-    if (!date) { skipped++; log('Skipped: no date (ad/promoted?)'); return false; }
+    const date = getTweetDate(tweet);
+    if (!date) { skipped++; log('Skipped: no date'); return false; }
     if (date.getTime() > cutoff) {
       skipped++; log(`Skipped: ${date.toLocaleDateString()} is newer than ${MAX_AGE_DAYS} days`);
       return false;
@@ -190,16 +211,19 @@ const deleteAllTweets = async () => {
 
     const own = isOwnTweet(tweet);
     const isRetweet = !!tweet.querySelector(selectors.unretweet);
-
     if (!own && !isRetweet) {
       skipped++; log('Skipped: not your tweet (conversation context)');
       return false;
     }
 
+    // Bring the tweet into view before acting on it
+    tweet.scrollIntoView({ block: 'center' });
+    await delay(400);
+    if (!tweet.isConnected) { processed.delete(id); return false; } // X re-rendered it; try again later
+
     try {
-      // Own tweet → delete; someone else's tweet you retweeted → unretweet
-      const result = own ? await doDelete(button, date) : await doUnretweet(tweet, date);
-      if (result === null) { processed.delete(button); return false; } // 429: try again later
+      const result = own ? await doDelete(tweet, date) : await doUnretweet(tweet, date);
+      if (result === null) { processed.delete(id); return false; } // 429: retry later
       return result;
     } catch (err) {
       console.error('Error:', err);
@@ -209,38 +233,48 @@ const deleteAllTweets = async () => {
 
   // ----- Main loop -----
   console.log(`Removing tweets by ${myHandle} older than ${new Date(cutoff).toLocaleString()}`);
-  let emptyRounds = 0;
+  let endRounds = 0;
 
   try {
     while (!window.stopDelete) {
-      await waitIfRateLimited();
+      if (await waitIfRateLimited()) { clickRetryIfShown(); await delay(3000); continue; }
 
-      const buttons = getButtons();
-      if (!buttons.length) {
-        if (++emptyRounds > EMPTY_RETRIES) break;
-        log(`No new tweets, scrolling (${emptyRounds}/${EMPTY_RETRIES})...`);
-        scrollToEnd();
-        await delay(5000);
-        continue;
-      }
-      emptyRounds = 0;
+      const tweets = getNewTweets();
 
-      for (const button of buttons) {
-        if (window.stopDelete) break;
-        await waitIfRateLimited();
-        if (await processTweet(button)) {
-          await delay(DELETE_DELAY);
-          if (deleted % BATCH_SIZE === 0) {
-            console.log(`Batch of ${BATCH_SIZE} done, pausing ${BATCH_PAUSE / 60000} min...`);
-            await countdown(BATCH_PAUSE, 'Batch pause');
+      if (tweets.length) {
+        endRounds = 0;
+        for (const tweet of tweets) {
+          if (window.stopDelete || rateLimited) break;
+          if (await processTweet(tweet)) {
+            await delay(DELETE_DELAY);
+            if (deleted % BATCH_SIZE === 0) {
+              console.log(`Batch of ${BATCH_SIZE} done, pausing ${BATCH_PAUSE / 60000} min...`);
+              await countdown(BATCH_PAUSE, 'Batch pause');
+            }
           }
         }
+        continue; // re-scan: deletions shift the timeline
       }
 
-      scrollToEnd();
-      await delay(3000);
+      // Nothing new on screen: scroll down a bit
+      window.scrollBy(0, window.innerHeight * 0.8);
+      await delay(2500);
+      if (getNewTweets().length) continue;
+
+      if (atBottom()) {
+        endRounds++;
+        if (endRounds > END_RETRIES) break;
+        log(`At bottom, waiting for more tweets (${endRounds}/${END_RETRIES})...`);
+        clickRetryIfShown();
+        // Nudge: scroll up a bit and back down to trigger loading
+        window.scrollBy(0, -800);
+        await delay(1000);
+        window.scrollTo(0, document.documentElement.scrollHeight);
+        await delay(4000 * endRounds); // wait longer each attempt
+      }
     }
     if (window.stopDelete) console.log('Stopped by user.');
+    else console.log('Reached the end of the timeline (or X stopped loading more).');
   } finally {
     window.fetch = origFetch;
     XMLHttpRequest.prototype.open = origOpen;
