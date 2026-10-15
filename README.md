@@ -3,7 +3,7 @@ Script to delete all X / Twitter tweets. (Credits go to https://github.com/techl
 Updated by Claude to add a MAX_AGE_DAYS to keep some recents posts and some rate limiting to prevent Too Many Requests (429)
 
 ### How to run:
-- Open Chrome and go to your X profile (https://x.com/USERNAME/with_replies)
+- Open Chrome and go to your X profile (https://x.com/USERNAME/with_replies). Make sure to scroll down as far as possible before running the script.
 - Open Chrome Developer Console. Copy/Paste the code
 - If needed adjust the MAX_AGE_DAYS setting
 - Run!
